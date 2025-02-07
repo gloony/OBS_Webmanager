@@ -8,211 +8,182 @@
         body { font-family: Arial, sans-serif; text-align: center; margin: 50px; }
         button { padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; }
         input { padding: 8px; margin-top: 10px; font-size: 16px; text-align: center; }
-        
-        /* Boutons des sources */
         .active { background-color: green; color: white; }
         .inactive { background-color: red; color: white; }
-
-        /* Boutons des scènes */
-        .scene-inactive { background-color: #EAEAEA; color: black; }
         .scene-active { background-color: #333; color: white; }
-
-        #error { color: red; margin-top: 10px; }
-
-        /* Barre de progression du média */
+        .scene-inactive { background-color: #EAEAEA; color: black; }
         #media-container { margin-top: 20px; display: none; }
         #media-bar { width: 80%; height: 20px; background: gray; border-radius: 10px; overflow: hidden; margin: auto; }
         #media-progress { height: 100%; width: 0%; background: blue; transition: width 0.5s linear; }
+        #reconnectingMessage{ color: red; font-size: 20px; position: fixed; top: 10px; left: 50%; transform: translateX(-50%); display: none; }
+        #warp{ display: none; }
     </style>
 </head>
-    <h1>OBS - Gestion de Stream</h1>
-    <h2>Scènes : </h2>
+<body>
+    <div id="warp">
+        <h1>OBS - Gestion de Stream</h1>
 
-    <div id="scene-list">
-        <p>Chargement des scènes...</p>
-    </div>
+        <h2>Live :</h2>
+        <button id="live" class="inactive"></button>
 
-    <h2>Sources :</h2>
-    <div id="source-list">
-        <p>Chargement des sources...</p>
-    </div>
+        <h2>Compteur :</h2>
+        <input type="text" id="text-input-counter"  />
 
-    <h2>Compteur :</h2>
-    <input type="text" id="text-input-counter"  />
+        <h2>Scènes :</h2>
+        <div id="scene-list"></div>
 
-    <h2>Média :</h2>
-    <div id="media-container">
-        <p id="media-time">00:00 / 00:00</p>
-        <div id="media-bar">
-            <div id="media-progress"></div>
+        <h2>Sources :</h2>
+        <div id="source-list"></div>
+
+        <h2>Média :</h2>
+        <div id="media-container">
+            <p id="media-source-name"></p>
+            <p id="media-time">00:00 / 00:00</p>
+            <div id="media-bar">
+                <div id="media-progress"></div>
+            </div>
         </div>
     </div>
 
-    <p id="error"></p>
+    <div id="reconnectingMessage">
+        Tentative de reconnexion à OBS...
+    </div>
 
     <script>
-		const textInputCounter = document.getElementById('text-input-counter');
-        async function fetchCurrentCounter() {
-            try {
-                const res = await fetch('/get-text/TXTTHCounter');
-                const data = await res.json();
-                if (data.text) {
-                    textInputCounter.value = data.text;
-                }
-            } catch (error) {
-				return;
+        const socket = new WebSocket('ws://' + window.location.hostname + ":" + window.location.port);
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'scenes') {
+                updateScenes(data);
             }
-        }
-		fetchCurrentCounter();
-		
-        async function changeTextCounter() {
-            const newText = textInputCounter.value.trim();
-            try {
-                const res = await fetch('/change-text/TXTTHCounter/' + newText);
-                const data = await res.json();
-                if (data.message) {
-                    messageElement.innerText = data.message;
-                }
-            } catch (error) {
-                return;
+
+            if (data.type === 'sources') {
+                updateSources(data);
             }
-        }
-		
-        textInputCounter.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter') {
-                changeTextCounter();
-				fetchCurrentCounter();
+
+            if (data.type === 'streamStatus') {
+                updateStreamStatus(data);
             }
-        });
-		
-        async function fetchScenes(startup) {
-		    if (startup===undefined) {
-			    startup = false;
-			}
-            try {
-                const res = await fetch('/scenes');
-                const data = await res.json();
-                if (data.error) throw new Error(data.error);
 
-                const sceneList = document.getElementById('scene-list');
-                sceneList.innerHTML = '';
-
-                data.scenes.forEach(scene => {
-                    const button = document.createElement('button');
-                    button.innerText = scene;
-                    button.classList.add(scene === data.activeScene ? 'scene-active' : 'scene-inactive');
-                    button.onclick = () => changeScene(scene);
-                    sceneList.appendChild(button);
-                });
-				
-				if (startup) {
-				    changeScene(data.activeScene);
-				}
-            } catch (error) {
-                showError(error.message);
+            if (data.type === 'mediaStatus') {
+                updateMediaStatus(data);
             }
-        }
 
-        async function changeScene(scene) {
-			clearError();
-            try {
-                const res = await fetch(`/change-scene/${encodeURIComponent(scene)}`);
-                const data = await res.json();
-                if (data.error) throw new Error(data.error);
-
-                displaySources(scene, data.sources);
-				fetchScenes();
-				if (!varfetchMedia) varfetchMedia = setInterval(fetchMediaStatus, 1000);
-            } catch (error) {
-                showError(error.message);
+            if (data.type === 'textCounter') {
+                updateTextCounter(data);
             }
-        }
 
-        function displaySources(scene, sources) {
-			clearError();
-            const sourceList = document.getElementById('source-list');
-            sourceList.innerHTML = '';
+            if (data.type === 'reconnecting') {
+                document.getElementById('reconnectingMessage').style.display = 'block';
+                document.getElementById('warp').style.display = 'none';
+            } else {
+                document.getElementById('reconnectingMessage').style.display = 'none';
+                document.getElementById('warp').style.display = 'block';
+            }
+        };
 
-            sources.forEach(source => {
+        function updateScenes(data) {
+            if ( data === undefined ) return;
+            const sceneList = document.getElementById('scene-list');
+            sceneList.innerHTML = '';
+
+            data.scenes.forEach(scene => {
                 const button = document.createElement('button');
-                button.innerText = source.name;
-                button.classList.add(source.active ? 'active' : 'inactive');
-                button.onclick = () => toggleSource(scene, source.name, button);
-                sourceList.appendChild(button);
+                button.innerText = scene;
+                button.classList.add(scene === data.activeScene ? 'scene-active' : 'scene-inactive');
+                button.onclick = () => socket.send(JSON.stringify({ type: 'changeScene', scene }));
+                sceneList.appendChild(button);
             });
         }
 
-        async function toggleSource(scene, source, button) {
-            try {
-                const res = await fetch(`/toggle-source/${encodeURIComponent(scene)}/${encodeURIComponent(source)}`);
-                const data = await res.json();
-                if (data.error) throw new Error(data.error);
+        function updateSources(data) {
+            if ( data === undefined ) return;
+            const sourceList = document.getElementById('source-list');
+            sourceList.innerHTML = '';
 
-                button.classList.toggle('active', data.active);
-                button.classList.toggle('inactive', !data.active);
+            data.sources.forEach(source => {
+                const button = document.createElement('button');
+                button.innerText = source.sourceName;
+                button.classList.add(source.sceneItemEnabled ? 'active' : 'inactive');
+                button.onclick = () => toggleSource(data.scene, source.sourceName, button);
+                sourceList.appendChild(button);
+            });
+        }
+        
+        function toggleSource(scene, source, button) {
+            socket.send(JSON.stringify({ type: 'toggleSource', scene, source }));
+        }
 
-				if (!varfetchMedia) varfetchMedia = setInterval(fetchMediaStatus, 1000);
-            } catch (error) {
-                showError(error.message);
+        function updateStreamStatus(data) {
+            const liveButton = document.getElementById('live');
+            if (data.isStreaming) {
+                liveButton.classList.add('active');
+                liveButton.classList.remove('inactive');
+                liveButton.innerText = "Live ON";
+            } else {
+                liveButton.classList.add('inactive');
+                liveButton.classList.remove('active');
+                liveButton.innerText = "Live OFF";
             }
         }
 
-		async function fetchMediaStatus() {
-			try {
-				const res = await fetch('/media-status');
-				const data = await res.json();
-				if (data.error) throw new Error(data.error);
+        function updateMediaStatus(data) {
+            const mediaContainer = document.getElementById('media-container');
+            const mediaName = document.getElementById('media-source-name');
+            const mediaTime = document.getElementById('media-time');
+            const mediaProgress = document.getElementById('media-progress');
 
-				if (data.state !== 'OBS_MEDIA_STATE_PLAYING') {
-					document.getElementById('media-container').style.display = 'none';
-					clearInterval(varfetchMedia);
-					varfetchMedia = null;
-					return;
-				}
+            if (data.error) {
+                mediaContainer.style.display = 'none';
+                return;
+            }
 
-				document.getElementById('media-container').style.display = 'block';
+            mediaContainer.style.display = 'block';
+            mediaName.innerText = data.sourceName;
 
-				// Afficher le nom du média
-				document.getElementById('media-source-name').innerText = data.sourceName;
+            const currentTime = formatTime(data.currentTime);
+            const totalTime = formatTime(data.totalTime);
+            mediaTime.innerText = `${currentTime} / ${totalTime}`;
 
-				// Mettre à jour la barre de progression
-				const timeText = document.getElementById('media-time');
-				const progressBar = document.getElementById('media-progress');
-
-				const currentTime = formatTime(data.currentTime);
-				const totalTime = formatTime(data.totalTime);
-				timeText.innerText = `${currentTime} / ${totalTime}`;
-
-				const progress = (data.currentTime / data.totalTime) * 100;
-				progressBar.style.width = `${progress}%`;
-			} catch (error) {
-				document.getElementById('media-container').style.display = 'none';
-				clearInterval(varfetchMedia);
-				varfetchMedia = null;
-				showError(error.message);
-			}
-		}
-
-		// Ajouter le nom du média dans l'HTML
-		document.getElementById('media-container').insertAdjacentHTML('afterbegin', '<h3 id="media-source-name"></h3>');
-
-        function formatTime(seconds) {
-			seconds  = seconds / 1000;
-            const min = Math.floor(seconds / 60);
-            const sec = Math.floor(seconds % 60);
-            return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+            const progress = (data.currentTime / data.totalTime) * 100;
+            mediaProgress.style.width = `${progress}%`;
         }
 
-        function showError(message) {
-            document.getElementById('error').innerText = message;
+        function formatTime(ms) {
+            const seconds = Math.floor(ms / 1000);
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+            return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
         }
 
-        function clearError(message) {
-            document.getElementById('error').innerText = '';
+        function updateTextCounter(data) {
+            const textInputCounter = document.getElementById('text-input-counter');
+            textInputCounter.value = data.text || '';
         }
 
-		let varfetchMedia = setInterval(fetchMediaStatus, 1000);
-        fetchScenes(true);
+        function fetchCurrentCounter() {
+            socket.send(JSON.stringify({ type: 'getTextCounter' }));
+        }
+
+        function changeTextCounter() {
+            const textInputCounter = document.getElementById('text-input-counter');
+            const newText = textInputCounter.value.trim();
+            if (newText !== '') {
+                socket.send(JSON.stringify({ type: 'changeTextCounter', newText }));
+            }
+        }
+
+        document.getElementById('text-input-counter').addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                changeTextCounter();
+            }
+        });
+
+        document.getElementById('live').addEventListener('click', () => {
+            socket.send(JSON.stringify({ type: 'toggleStream' }));
+        });
     </script>
 </body>
 </html>
