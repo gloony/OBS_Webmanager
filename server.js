@@ -1,22 +1,31 @@
+//🛑📢📌🔍⚠️❌✅
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const { OBSWebSocket } = require('obs-websocket-js');
-const readline = require('readline');
 const path = require('path');
 const Service = require('node-windows').Service;
 
-const obs = new OBSWebSocket();
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const obs = new OBSWebSocket();
 const PORT = 4085;
+
 const OBS_HOST = '127.0.0.1';
 const OBS_PORT = '4455';
 const OBS_PASSWORD = '123456';
 
+let checkOBSInterval = null;
+let statusInterval = null;
+
 let obsConnected = false;
 
 var svc = new Service({
-    name:'OBS WS Manager',
-    description: 'Control OBS from Browser',
-    script: 'D:\\OBS\\NodeOBS\\server.js',
+    name:'OBS Web Manager',
+    description: 'Control OBS from your Browser',
+    script: path.join(__dirname, 'server.js'),
     stopparentfirst: true
 });
 
@@ -36,12 +45,6 @@ if(args.includes('install')){
 	return;
 }
 
-// Créer l'interface readline pour lire les commandes du terminal
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
-
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Connexion à OBS
@@ -49,138 +52,157 @@ async function connectOBS() {
     try {
         await obs.connect('ws://' + OBS_HOST + ':' + OBS_PORT, OBS_PASSWORD);
         console.log('✅ Connecté à OBS WebSocket');
-		obsConnected = true;
-    } catch (error) {
-        console.log('❌ Erreur de connexion OBS:', error);
+        
+        obsConnected = true;
+        
+        // Dès que la connexion est établie, envoyer les données nécessaires
+        sendScenes();
+        sendSources();
+        sendStreamStatus();
+        sendMediaStatus();
+
+        // Si la reconnexion a réussi, arrêter l'intervalle
+        if (!statusInterval) {
+            clearInterval(statusInterval);
+        }
+        statusInterval = setInterval(sendAllStatus, 500);
+    } catch (err) {
+        obsConnected = false;
+        console.error('⚠️Erreur de connexion OBS:', err);
+        if (!statusInterval) {
+            clearInterval(statusInterval);
+            statusInterval = null;
+        }
+        broadcast({ type: 'reconnecting' });
     }
 }
 
-// Fonction pour vérifier la connexion à OBS
-async function checkObsConnection() {
-    try {
-        // Effectuer une requête basique pour vérifier si OBS est connecté
-        const response = await obs.call('GetVersion');
-        
-        // Si la requête réussit, OBS est bien connecté
-        if (response) {
-            if (!obsConnected) {
-                console.log("✅ Connexion à OBS rétablie.");
-                obsConnected = true;
+// Gère les connexions WebSocket
+wss.on('connection', (ws) => {
+    console.log('📢 Client connecté');
+    
+    ws.on('message', async (message) => {
+        if (!obsConnected) return;
+
+        const data = JSON.parse(message);
+
+        if (data.type === 'changeScene') {
+            await obs.call('SetCurrentProgramScene', { sceneName: data.scene });
+            sendScenes();
+            sendSources();
+        }
+
+        if (data.type === 'toggleSource') {
+            const { scene, source } = data;
+            const sourceInfo = await obs.call('GetSceneItemList', { sceneName: scene });
+            const item = sourceInfo.sceneItems.find(item => item.sourceName === source);
+
+            if (item) {
+                await obs.call('SetSceneItemEnabled', {
+                    sceneName: scene,
+                    sceneItemId: item.sceneItemId,
+                    sceneItemEnabled: !item.sceneItemEnabled
+                });
+                sendSources();
             }
         }
-    } catch (error) {
-        if (obsConnected) {
-            console.error("❌ La connexion à OBS a été perdue. Tentative de reconnexion...");
-            obsConnected = false;
-        } else {
-			connectOBS();
-		}
+
+        if (data.type === 'toggleStream') {
+            const status = await obs.call('GetStreamStatus');
+            if (status.outputActive) {
+                await obs.call('StopStream');
+            } else {
+                await obs.call('StartStream');
+            }
+            sendStreamStatus();
+        }
+
+        if (data.type === 'changeTextCounter') {
+            try {
+                await obs.call('SetInputSettings', {
+                    inputName: 'TXTTHCounter',
+                    inputSettings: {
+                        text: data.newText,
+                    }
+                });
+            } catch (error) {
+                console.error('❌ Erreur lors du changement de texte:', error);
+            }
+            sendTextCounter();
+        }
+    });
+
+    if (obsConnected) {
+        sendScenes();
+        sendSources();
+        sendStreamStatus();
+        sendMediaStatus();
+        sendTextCounter();
+    } else {
+        broadcast({ type: 'reconnecting', message: 'Tentative de reconnexion à OBS...' });
+    }
+});
+
+// Connexion WebSocket OBS + Envoi des mises à jour en temps réel
+obs.on('Event', async (event) => {
+    console.log('📢' + event);
+    if (event.eventType === 'CurrentProgramSceneChanged') {
+        sendScenes(); // Mise à jour des scènes
+        sendSources(); // Mise à jour des sources
+    }
+    
+    if (event.eventType === 'StreamStateChanged') {
+        sendStreamStatus(); // Mise à jour du statut du live
+    }
+
+    if (event.eventType === 'MediaInputPlaybackEnded' || event.eventType === 'MediaInputPlaybackStarted') {
+        sendMediaStatus(); // Mise à jour du statut média
+    }
+});
+
+function sendAllStatus(){
+    if (!obsConnected) return;
+    sendStreamStatus();
+    sendMediaStatus();
+}
+
+// Envoi des scènes en temps réel
+async function sendScenes() {
+    try {
+        const scenes = await obs.call('GetSceneList');
+        const activeScene = await obs.call('GetCurrentProgramScene');
+
+        broadcast({ type: 'scenes', scenes: scenes.scenes.map(s => s.sceneName), activeScene: activeScene.currentProgramSceneName });
+    } catch (err) {
+        console.error('⚠️ Erreur de connexion OBS:', err);
     }
 }
 
-// Récupérer la liste des scènes
-app.get('/scenes', async (req, res) => {
+// Envoie les sources de la scène active
+async function sendSources() {
     try {
-        const { scenes, currentProgramSceneName } = await obs.call('GetSceneList');
-        res.json({ scenes: scenes.map(scene => scene.sceneName), activeScene: currentProgramSceneName });
-    } catch (error) {
-        res.status(500).json({ error: 'Impossible de récupérer les scènes' });
-    }
-});
-
-// Changer de scène et récupérer ses sources
-app.get('/change-scene/:scene', async (req, res) => {
-    const sceneName = req.params.scene;
-    try {
-        await obs.call('SetCurrentProgramScene', { sceneName });
-
-        const { sceneItems } = await obs.call('GetSceneItemList', { sceneName });
-        const sources = sceneItems.map(item => ({
-            name: item.sourceName,
-            active: item.sceneItemEnabled
-        }));
-
-        res.json({ success: true, sources });
-    } catch (error) {
-        res.status(500).json({ error: 'Impossible de changer de scène' });
-    }
-});
-
-// Activer/Désactiver une source
-app.get('/toggle-source/:scene/:source', async (req, res) => {
-    const { scene, source } = req.params;
-    try {
-        // Récupérer la liste des sources pour trouver l'ID de la source
-        const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: scene });
-        const sceneItem = sceneItems.find(item => item.sourceName === source);
-
-        if (!sceneItem) {
-            throw new Error(`Source "${source}" introuvable dans la scène "${scene}"`);
-        }
-
-        // Récupérer l'état actuel de la source
-        const { sceneItemEnabled } = await obs.call('GetSceneItemEnabled', {
-            sceneName: scene,
-            sceneItemId: sceneItem.sceneItemId
-        });
-
-        // Inverser l'état de la source
-        await obs.call('SetSceneItemEnabled', {
-            sceneName: scene,
-            sceneItemId: sceneItem.sceneItemId,
-            sceneItemEnabled: !sceneItemEnabled
-        });
-
-        res.json({ success: true, source, active: !sceneItemEnabled });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Changement de texte Dynamique
-app.get('/change-text/:source/:newText', async (req, res) => {
-    const { source, newText } = req.params;
-    try {
-        // Changer le texte de la source
-        await obs.call('SetInputSettings', {
-            inputName: source, // Nom de la source
-            inputSettings: {
-				text: newText,
-			}
-        });
-
-        res.json({ message: 'Texte changé avec succès.' });
-    } catch (error) {
-        console.error('❌ Erreur lors du changement de texte:', error);
-        res.status(500).json({ error: 'Impossible de changer le texte de la source.' });
-    }
-});
-
-// Récupération de texte Dynamique
-app.get('/get-text/:source', async (req, res) => {
-    const { source } = req.params;
+        const activeScene = await obs.call('GetCurrentProgramScene');
+        const sceneItems = await obs.call('GetSceneItemList', { sceneName: activeScene.currentProgramSceneName });
     
-    try {
-        // Récupérer les paramètres de la source
-        const { inputSettings } = await obs.call('GetInputSettings', { inputName: source });
-        
-        // Vérifier si la source contient un champ 'text'
-        if (inputSettings && inputSettings.text) {
-            // Retourner le texte actuel
-            res.json({ text: inputSettings.text });
-        } else {
-            // Si le texte n'est pas trouvé dans les paramètres
-            res.status(404).json({ error: 'Le texte de la source n\'a pas été trouvé.' });
-        }
-    } catch (error) {
-        console.error('❌ Erreur lors de la récupération du texte:', error);
-        res.status(500).json({ error: 'Impossible de récupérer le texte de la source.' });
+        broadcast({ type: 'sources', scene: activeScene.currentProgramSceneName, sources: sceneItems.sceneItems });
+    } catch (err) {
+        console.error('⚠️ Erreur de connexion OBS:', err);
     }
-});
+}
 
-// Récupération de la position sur un media
-app.get('/media-status', async (req, res) => {
-    //try {
+// Envoie l'état du stream
+async function sendStreamStatus() {
+    try {
+        const status = await obs.call('GetStreamStatus');
+        broadcast({ type: 'streamStatus', isStreaming: status.outputActive });
+    } catch (err) {
+        console.error('⚠️ Erreur de connexion OBS:', err);
+    }
+}
+
+// Envoie l'état du média en cours
+async function sendMediaStatus() {
+    try {
         // Récupérer la scène active
         const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
 
@@ -203,55 +225,91 @@ app.get('/media-status', async (req, res) => {
         }
 
         if (!mediaSource) {
-            return res.json({ error: 'Aucun média détecté dans la scène active.' });
+            broadcast({
+                type: 'mediaStatus',
+                error: 'NO_MEDIA'
+            });
+            return;
         }
 
-        // Récupérer les infos du média
         const { mediaState, mediaDuration, mediaCursor } = await obs.call('GetMediaInputStatus', {
             inputName: mediaSource
         });
 
-        res.json({
+        broadcast({
+            type: 'mediaStatus',
+            state: mediaState,
             sourceName: mediaSource,
-            state: mediaState, // playing, paused, stopped
-            currentTime: mediaCursor || 0, // Temps actuel (si non défini, mettre à 0)
-            totalTime: mediaDuration // Durée totale
+            currentTime: mediaCursor,
+            totalTime: mediaDuration
         });
-    /*} catch (error) {
-        res.status(500).json({ error: 'Impossible de récupérer le statut du média.' });
-    }*/
-});
+    } catch (error) {
+        console.error("⚠️ Erreur lors de la récupération du média:", error);
+        broadcast({
+            type: 'mediaStatus',
+            error: "Erreur lors de la récupération du média.",
+            sourceName: null,
+            currentTime: null,
+            totalTime: null
+        });
+    }
+}
 
-// Fonction qui s'exécute lorsque l'utilisateur tape "debug"
-rl.on('line', async (input) => {
-    if (input.trim().toLowerCase() === 'debug') {
-        console.log("🔧 Commande 'debug' détectée. Exécution du débogage...");
-        try {
-            // Récupérer la scène active
-            const { currentProgramSceneName } = await obs.call('GetCurrentProgramScene');
-
-            // Récupérer toutes les sources de la scène active
-            const { sceneItems } = await obs.call('GetSceneItemList', { sceneName: currentProgramSceneName });
-
-            console.log(`📢 Scène active: ${currentProgramSceneName}`);
-            console.log('📌 Sources détectées :', sceneItems.map(item => item.sourceName));
-
-            for (const item of sceneItems) {
-                try {
-                    // Vérifier si la source est un "ffmpeg_source"
-                    const { inputKind } = await obs.call('GetInputSettings', { inputName: item.sourceName });
-
-                    console.log(`🔍 Source : ${item.sourceName} | Type : ${inputKind}`);
-                } catch (err) {
-                    console.warn(`⚠️ Impossible de récupérer les infos de ${item.sourceName}`);
-                }
-            }
-        } catch (error) {
-            console.error('❌ Erreur serveur:', error);
+// Envoie le numéro de Counter
+async function sendTextCounter() {
+    try {
+        const { inputSettings } = await obs.call('GetInputSettings', { inputName: 'TXTTHCounter' });
+        if (inputSettings && inputSettings.text) {
+            broadcast({
+                type: 'textCounter',
+                text: inputSettings.text
+            });
         }
-    }else if (input.trim().toLowerCase() === 'exit') {
-		gracefulShutdown();
-	}
+    } catch (error) {
+        console.error("❌ " + error);
+    }
+}
+
+// Fonction pour vérifier la connexion à OBS
+async function checkObsConnection() {
+    if (!obsConnected){
+        return connectOBS();
+    }
+    try {
+        // Effectuer une requête basique pour vérifier si OBS est connecté
+        const response = await obs.call('GetVersion');
+        
+        // Si la requête réussit, OBS est bien connecté
+        if (response) {
+            if (!obsConnected) {
+                console.log("✅ Connexion à OBS rétablie.");
+                obsConnected = true;
+            }
+        }
+    } catch (error) {
+        if (obsConnected) {
+            console.error("❌ La connexion à OBS a été perdue. Tentative de reconnexion...");
+            obsConnected = false;
+        } else {
+			connectOBS();
+		}
+    }
+}
+
+checkOBSInterval = setInterval(checkObsConnection, 5000); 
+
+// Fonction de broadcast à tous les clients
+function broadcast(data) {
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
+
+server.listen(PORT, () => {
+    console.log(`✅ Serveur démarré sur http://localhost:${PORT}`);
+    connectOBS();
 });
 
 // Fonction pour fermer proprement le serveur et OBS
@@ -259,8 +317,11 @@ function gracefulShutdown() {
     console.log("🛑 Fermeture en cours...");
 
 	// Supprimer les Timers
-	clearInterval(varcheckOBS);
-	varcheckOBS = null;
+	clearInterval(checkOBSInterval);
+	checkOBSInterval = null;
+
+    clearInterval(statusInterval);
+    statusInterval = null;
 	
     // Fermer la connexion OBS
     obs.disconnect().then(() => {
@@ -282,30 +343,9 @@ function gracefulShutdown() {
     }, 5000);  // Attente de 5 secondes avant de forcer la fermeture
 }
 
-// Lors de la reconnexion à OBS, on peut réinitialiser certaines variables ou informer l'utilisateur
-obs.on('Open', () => {
-    console.log("🔌 Connexion à OBS établie !");
-    obsConnected = true;
-});
-
-// En cas de déconnexion, on réinitialise l'état
-obs.on('Close', () => {
-    console.error("❌ Perte de connexion avec OBS.");
-    obsConnected = false;
-});
-
-// Lancer le serveur
-const server = app.listen(PORT, async () => {
-    console.log(`🚀 Serveur sur http://localhost:${PORT}`);
-    await connectOBS();
-});
-
-// Vérifier la connexion toutes les 5 secondes
-let varcheckOBS = setInterval(checkObsConnection, 5000);  // 5000ms = 5 secondes
-
 // Gérer les signaux d'arrêt (Ctrl+C)
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
 svc.on('stop', gracefulShutdown);
-process.on('message', m => { if(m == 'shutdown'){ gracefulShutdown(); } });
+process.on('message', m => { if(m == 'shutdown'){ gracefulShutdown(); } })
